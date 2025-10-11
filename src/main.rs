@@ -4,7 +4,7 @@ use regex::Regex;
 use anyhow::{bail, Result};
 use std::process::Command;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{absolute, PathBuf};
 use std::io::Write;
 use uuid::Uuid;
 
@@ -18,8 +18,8 @@ impl Preprocessor for MermaidPreprocessor {
     fn run(&self, ctx: &PreprocessorContext, mut book: Book) -> Result<Book> {
         let mermaid_re = Regex::new(r"```mermaid\n([\s\S]*?)\n```")?;
 
-        let output_dir = ctx.root.join("src").join("generated").join("diagrams");
-        fs::remove_dir_all(&output_dir)?;
+        let output_dir = ctx.config.book.src.join("generated").join("diagrams");
+        if output_dir.exists() { fs::remove_dir_all(&output_dir)?; }
         fs::create_dir_all(&output_dir)?;
 
         for item in &mut book.sections {
