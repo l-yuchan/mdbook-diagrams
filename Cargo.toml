@@ -3,7 +3,10 @@ name = "mdbook-diagrams"
 version = "0.1.0"
 edition = "2024"
 description = "Mermaid diagram generator for mdbook"
-repository = "https://github.com/chabun314/mdbook-diagrams"
+repository = "https://github.com/l-yuchan/mdbook-diagrams"
+license = "MIT"
+keywords = ["mermaid", "diagram", "mdbook", "preprocessor"]
+categories = ["visualization"]
 
 [dependencies]
 mdbook = "0.4.37"
