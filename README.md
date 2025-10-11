@@ -25,7 +25,7 @@ Diagrams are generated at build time and saved at `src/generated/diagrams`. No n
 
 ## Usage
 
-First, ensure you have installed mermaid-cli and have `mmdc` in your env
+First, ensure you have installed mermaid-cli and have `mmdc` in your env PATH
 ```bash
 npm install -g @mermaid-js/mermaid-cli
 mmdc --version
@@ -42,3 +42,7 @@ After the installation, you can add this line to your `book.toml` to enable the 
 ```
 
 And that's it! Build your mdbook and see your diagrams embedded.
+
+## NOTE
+
+If you are using `mdbook serve`, you would like to add `src/generated/` to your `.gitignore`(in your book root) to prevent generated diagrams invoking rebuild.
