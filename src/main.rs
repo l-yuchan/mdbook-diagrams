@@ -42,7 +42,7 @@ fn handle_preprocessing() -> Result<(), Error> {
 
     if !version_req.matches(&book_version) {
         eprintln!(
-            "Warning: The mdbook-diagrams was built against version {} of mdbook, \
+            "Warning: mdbook-diagrams was built against version {} of mdbook, \
              but we\'re being called from version {}",
             mdbook::MDBOOK_VERSION,
             ctx.mdbook_version

@@ -3,6 +3,7 @@ use mdbook::BookItem;
 use mdbook::book::{Book, Chapter};
 use mdbook::preprocess::{Preprocessor, PreprocessorContext};
 use regex::Regex;
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::ops::Range;
@@ -13,7 +14,6 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
 use toml::value::Table;
-use uuid::Uuid;
 
 /// Rendering mode for diagrams
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,12 +29,14 @@ struct ChapterEdit {
     chapter_path: PathBuf,
     range: Range<usize>, // The byte range of the original mermaid block
     new_string: String,
+    cached_filename: String, // The cache filename that was used or created
 }
 
 pub struct DiagramsPreprocessor {
     render_mode: RenderMode,
     mmdc_cmd: String,
     output_format: String,
+    enable_cache: bool,
 }
 
 impl DiagramsPreprocessor {
@@ -76,11 +78,28 @@ impl DiagramsPreprocessor {
             })
             .unwrap_or_else(|| "svg".to_string());
 
+        let enable_cache = config
+            .as_ref()
+            .and_then(|table| table.get("enable-cache"))
+            .and_then(|val| val.as_bool())
+            .unwrap_or(true);
+
         DiagramsPreprocessor {
             render_mode,
             mmdc_cmd,
             output_format,
+            enable_cache,
         }
+    }
+
+    /// Compute a cache hash from diagram content and rendering configuration
+    fn compute_cache_hash(content: &str, output_format: &str, mmdc_cmd: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        hasher.update(output_format.as_bytes());
+        hasher.update(mmdc_cmd.as_bytes());
+        let result = hasher.finalize();
+        format!("{:x}", result)
     }
 
     fn prepare_mermaid_files(&self, ctx: &PreprocessorContext) -> Result<()> {
@@ -151,9 +170,6 @@ mermaid.initialize({ startOnLoad: true });
         let mermaid_re = Regex::new(r#"```mermaid\r?\n([\s\S]*?)\r?\n```"#)?;
 
         let output_dir = ctx.root.join(&ctx.config.book.src).join("generated").join("diagrams");
-        if output_dir.exists() {
-            tokio::fs::remove_dir_all(&output_dir).await?;
-        }
         tokio::fs::create_dir_all(&output_dir).await?;
 
         let num_cpus = std::thread::available_parallelism()
@@ -182,6 +198,20 @@ mermaid.initialize({ startOnLoad: true });
             }
         ).collect();
 
+        // Extract referenced filenames for cleanup
+        let referenced_files: std::collections::HashSet<String> = edits
+            .iter()
+            .map(|edit| edit.cached_filename.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        // Clean up unreferenced cache files if caching is enabled
+        if self.enable_cache {
+            if let Err(e) = Self::cleanup_unreferenced_files(&output_dir, &referenced_files).await {
+                eprintln!("[mdbook-diagrams] Warning: Failed to clean up cache files: {}", e);
+            }
+        }
+
         // Group edits by chapter path for easier processing
         let mut edits_by_chapter: HashMap<PathBuf, Vec<ChapterEdit>> = HashMap::new();
         for edit in edits {
@@ -203,7 +233,7 @@ mermaid.initialize({ startOnLoad: true });
                 // Sort edits by range start in descending order to avoid offset issues
                 let mut sorted_edits = chapter_edits;
                 sorted_edits.sort_by_key(|e| e.range.start);
-                sorted_edits.reverse(); // Apply from end to beginning
+                sorted_edits.reverse();
 
                 for edit in sorted_edits {
                     // Replace the content using the byte range
@@ -211,7 +241,7 @@ mermaid.initialize({ startOnLoad: true });
                 }
             }
 
-            // Recursively apply to sub-items
+            // Recursively apply to sub items
             for sub_item in &mut chapter.sub_items {
                 DiagramsPreprocessor::apply_edits_to_book_item_recursively(sub_item, edits_by_chapter);
             }
@@ -255,9 +285,10 @@ mermaid.initialize({ startOnLoad: true });
         for cap in mermaid_re.captures_iter(&chapter.content) {
             let full_match_range = cap.get(0).unwrap().range();
             let mermaid_code = cap[1].to_string();
+            let original_block = cap.get(0).unwrap().as_str().to_string();
 
-            let uuid = Uuid::new_v4();
-            let output_filename = format!("{}.{}", uuid, self.output_format);
+            let cache_hash = Self::compute_cache_hash(&mermaid_code, &self.output_format, &self.mmdc_cmd);
+            let output_filename = format!("{}.{}", cache_hash, self.output_format);
             let output_filepath = output_dir.join(&output_filename);
 
             let chapter_path = chapter.path.clone().unwrap_or_default();
@@ -282,63 +313,128 @@ mermaid.initialize({ startOnLoad: true });
 
             let semaphore_clone = semaphore.clone();
             let mmdc_cmd = self.mmdc_cmd.clone();
+            let enable_cache = self.enable_cache;
 
             futures.push(async move {
-                let _permit = semaphore_clone.acquire().await?;
-                let mut command = if cfg!(windows) {
-                    let mut cmd = tokio::process::Command::new("powershell");
-                    cmd.arg("-NoProfile")
-                        .arg("-Command")
-                        .arg(&mmdc_cmd)
-                        .arg("-i")
-                        .arg("-")
-                        .arg("-o")
-                        .arg(&output_filepath)
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped());
-                    cmd
-                } else {
-                    let mut cmd = tokio::process::Command::new(&mmdc_cmd);
-                    cmd.arg("-i")
-                        .arg("-")
-                        .arg("-o")
-                        .arg(&output_filepath)
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped());
-                    cmd
-                };
-
-                let mut child = command.spawn()?;
-
-                if let Some(mut stdin) = child.stdin.take() {
-                    AsyncWriteExt::write_all(&mut stdin, mermaid_code.as_bytes()).await?;
-                }
-
-                let output = child.wait_with_output().await?;
-
-                if !output.status.success() {
-                    bail!(
-                        "mmdc failed: {}\nStdout: {}\nStderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
+                if enable_cache && output_filepath.exists() {
+                    // Cache hit - skip mmdc execution
+                    let img_tag = format!(
+                        "![diagram](./{})",
+                        relative_output_path.to_string_lossy().replace("\\", "/")
                     );
+                    return Ok(ChapterEdit {
+                        chapter_path,
+                        range: full_match_range,
+                        new_string: img_tag,
+                        cached_filename: output_filename.clone(),
+                    });
                 }
 
-                let img_tag = format!(
-                    "![diagram](./{})",
-                    relative_output_path.to_string_lossy().replace("\\", "/")
-                );
-                Ok(ChapterEdit {
-                    chapter_path,
-                    range: full_match_range,
-                    new_string: img_tag,
-                })
+                // Cache miss or caching disabled - generate diagram
+                let result = async {
+                    let _permit = semaphore_clone.acquire().await?;
+                    let mut command = if cfg!(windows) {
+                        let mut cmd = tokio::process::Command::new("powershell");
+                        cmd.arg("-NoProfile")
+                            .arg("-Command")
+                            .arg(&mmdc_cmd)
+                            .arg("-i")
+                            .arg("-")
+                            .arg("-o")
+                            .arg(&output_filepath)
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped());
+                        cmd
+                    } else {
+                        let mut cmd = tokio::process::Command::new(&mmdc_cmd);
+                        cmd.arg("-i")
+                            .arg("-")
+                            .arg("-o")
+                            .arg(&output_filepath)
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped());
+                        cmd
+                    };
+
+                    let mut child = command.spawn()?;
+
+                    if let Some(mut stdin) = child.stdin.take() {
+                        AsyncWriteExt::write_all(&mut stdin, mermaid_code.as_bytes()).await?;
+                    }
+
+                    let output = child.wait_with_output().await?;
+
+                    if !output.status.success() {
+                        bail!(
+                            "mmdc failed: {}\nStderr: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+
+                    Ok::<String, anyhow::Error>(format!(
+                        "![diagram](./{})",
+                        relative_output_path.to_string_lossy().replace("\\", "/")
+                    ))
+                }.await;
+
+                // Handle result - on error, keep the original mermaid block with an error message
+                match result {
+                    Ok(img_tag) => Ok(ChapterEdit {
+                        chapter_path,
+                        range: full_match_range,
+                        new_string: img_tag,
+                        cached_filename: output_filename.clone(),
+                    }),
+                    Err(e) => {
+                        let error_msg = format!("{:#}", e);
+                        eprintln!("[mdbook-diagrams] {}", error_msg);
+
+                        // Keep original mermaid block with error comment
+                        let error_comment = format!(
+                            "<!-- Error generating diagram: {} -->\n{}",
+                            error_msg.lines().next().unwrap_or("Unknown error"),
+                            original_block
+                        );
+                        Ok(ChapterEdit {
+                            chapter_path,
+                            range: full_match_range,
+                            new_string: error_comment,
+                            cached_filename: String::new(),
+                        })
+                    }
+                }
             }.boxed())
         }
         futures
+    }
+
+    /// Remove cache files that are not referenced in the current build
+    async fn cleanup_unreferenced_files(
+        output_dir: &PathBuf,
+        referenced_files: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(output_dir).await?;
+        let mut removed_count = 0;
+
+        while let Some(entry) = entries.next_entry().await? {
+            if let Ok(filename) = entry.file_name().into_string() {
+                if !referenced_files.contains(&filename) && !filename.is_empty() {
+                    if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                        eprintln!(
+                            "[mdbook-diagrams] Warning: Failed to remove unreferenced cache file {}: {}",
+                            filename, e
+                        );
+                    } else {
+                        removed_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

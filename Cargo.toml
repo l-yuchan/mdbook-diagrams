@@ -1,6 +1,6 @@
 [package]
 name = "mdbook-diagrams"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 description = "Mermaid diagram generator for mdbook"
 repository = "https://github.com/l-yuchan/mdbook-diagrams"
@@ -12,7 +12,6 @@ categories = ["visualization"]
 mdbook = "0.4"
 anyhow = "1.0"
 regex = "1"
-uuid = { version = "1", features = ["v4"] }
 serde_json = "1.0"
 clap = "4.5"
 semver = "1.0"
@@ -20,3 +19,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "fs", "macros
 futures = "0.3"
 toml = "0.5.11"
 reqwest = { version = "0.12", features = ["blocking"] }
+sha2 = "0.10"
