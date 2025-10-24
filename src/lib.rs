@@ -417,7 +417,6 @@ mermaid.initialize({ startOnLoad: true });
         referenced_files: &std::collections::HashSet<String>,
     ) -> Result<()> {
         let mut entries = tokio::fs::read_dir(output_dir).await?;
-        let mut removed_count = 0;
 
         while let Some(entry) = entries.next_entry().await? {
             if let Ok(filename) = entry.file_name().into_string() {
@@ -427,8 +426,6 @@ mermaid.initialize({ startOnLoad: true });
                             "[mdbook-diagrams] Warning: Failed to remove unreferenced cache file {}: {}",
                             filename, e
                         );
-                    } else {
-                        removed_count += 1;
                     }
                 }
             }

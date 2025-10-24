@@ -7,6 +7,7 @@ repository = "https://github.com/l-yuchan/mdbook-diagrams"
 license = "MIT"
 keywords = ["mermaid", "diagram", "mdbook", "preprocessor"]
 categories = ["visualization"]
+authors = ["Lee Yuchan"]
 
 [dependencies]
 mdbook = "0.4"
