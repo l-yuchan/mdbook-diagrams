@@ -1,6 +1,6 @@
 [package]
 name = "mdbook-diagrams"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Mermaid diagram generator for mdbook"
 repository = "https://github.com/l-yuchan/mdbook-diagrams"

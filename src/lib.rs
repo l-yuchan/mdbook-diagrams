@@ -34,7 +34,7 @@ impl DiagramsPreprocessor {
     async fn async_process_book(&self, ctx: &PreprocessorContext, book: &mut Book) -> Result<()> {
         let mermaid_re = Regex::new(r#"```mermaid\r?\n([\s\S]*?)\r?\n```"#)?;
 
-        let output_dir = ctx.config.book.src.join("generated").join("diagrams");
+        let output_dir = ctx.root.join(&ctx.config.book.src).join("generated").join("diagrams");
         if output_dir.exists() {
             tokio::fs::remove_dir_all(&output_dir).await?;
         }
@@ -118,6 +118,7 @@ impl DiagramsPreprocessor {
         futures
     }
 
+    /// Generate SVGs for all mermaid blocks in a chapter and return a list of edits to apply.
     fn collect_edits_from_chapter(
         &'_ self,
         mermaid_re: & Regex,
