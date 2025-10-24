@@ -32,7 +32,7 @@ fn handle_preprocessing() -> Result<(), Error> {
     let (ctx, book) = CmdPreprocessor::parse_input(io::stdin())?;
 
     let preprocessor_config = ctx.config
-        .get_preprocessor("mdbook-diagrams");
+        .get_preprocessor("diagrams");
     let config = preprocessor_config;
 
     let preprocessor = DiagramsPreprocessor::new(config.cloned());

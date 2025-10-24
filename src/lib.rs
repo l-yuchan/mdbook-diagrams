@@ -15,6 +15,15 @@ use tokio::io::AsyncWriteExt;
 use toml::value::Table;
 use uuid::Uuid;
 
+/// Rendering mode for diagrams
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RenderMode {
+    /// Pre-render diagrams at build time (default)
+    PreRender,
+    /// Embed mermaid code and render at runtime in browser
+    Runtime,
+}
+
 /// Represents an edit to be applied to a chapter's content.
 struct ChapterEdit {
     chapter_path: PathBuf,
@@ -23,12 +32,119 @@ struct ChapterEdit {
 }
 
 pub struct DiagramsPreprocessor {
-    config: Option<Table>,
+    render_mode: RenderMode,
+    mmdc_cmd: String,
+    output_format: String,
 }
 
 impl DiagramsPreprocessor {
     pub fn new(config: Option<Table>) -> DiagramsPreprocessor {
-        DiagramsPreprocessor { config }
+        let render_mode = config
+            .as_ref()
+            .and_then(|table| table.get("render-mode"))
+            .and_then(|val| val.as_str())
+            .map(|s| match s {
+                "runtime" => RenderMode::Runtime,
+                "pre-render" => RenderMode::PreRender,
+                _ => {
+                    eprintln!("[mdbook-diagrams] Invalid render-mode: {}, falling back to pre-render", s);
+                    eprintln!("[mdbook-diagrams] Available modes: runtime, pre-render");
+                    RenderMode::PreRender
+                },
+            })
+            .unwrap_or(RenderMode::PreRender);
+
+        let mmdc_cmd = config
+            .as_ref()
+            .and_then(|table| table.get("mmdc-cmd"))
+            .and_then(|val| val.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "mmdc".to_string());
+
+        let output_format = config
+            .as_ref()
+            .and_then(|table| table.get("output-format"))
+            .and_then(|val| val.as_str())
+            .map(|s| match s {
+                "svg" => "svg".to_string(),
+                "png" => "png".to_string(),
+                _ => {
+                    eprintln!("[mdbook-diagrams] Invalid output-format: {}, falling back to svg", s);
+                    eprintln!("[mdbook-diagrams] Available formats: svg, png");
+                    "svg".to_string()
+                },
+            })
+            .unwrap_or_else(|| "svg".to_string());
+
+        DiagramsPreprocessor {
+            render_mode,
+            mmdc_cmd,
+            output_format,
+        }
+    }
+
+    fn prepare_mermaid_files(&self, ctx: &PreprocessorContext) -> Result<()> {
+        let theme_dir = ctx.root.join("theme");
+        std::fs::create_dir_all(&theme_dir)?;
+
+        let mermaid_js_path = theme_dir.join("mermaid.min.js");
+        let mermaid_init_path = theme_dir.join("mermaid-init.js");
+
+        let mut js_updated = false;
+
+        // Download mermaid.min.js if it doesn't exist
+        if !mermaid_js_path.exists() {
+            eprintln!("Downloading mermaid.min.js...");
+            let url = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js";
+            let response = reqwest::blocking::get(url)?;
+            let content = response.bytes()?;
+            std::fs::write(&mermaid_js_path, content)?;
+            js_updated = true;
+            eprintln!("Downloaded mermaid.min.js to theme/mermaid.min.js");
+        }
+
+        // Create mermaid-init.js if it doesn't exist
+        if !mermaid_init_path.exists() {
+            let init_script = r#"import mermaid from './mermaid.min.js';
+mermaid.initialize({ startOnLoad: true });
+"#;
+            std::fs::write(&mermaid_init_path, init_script)?;
+            js_updated = true;
+            eprintln!("Created mermaid-init.js at theme/mermaid-init.js");
+        }
+
+        if js_updated {
+            eprintln!("[mdbook-diagrams] mermaid.min.js and mermaid-init.js is created in theme/ directory.");
+            eprintln!("[mdbook-diagrams] To enable runtime rendering, please add the following to your book.toml:\n");
+            eprintln!("[output.html]");
+            eprintln!("additional-js = [\"theme/mermaid.min.js\", \"theme/mermaid-init.js\"]");
+        }
+
+        Ok(())
+    }
+
+    fn process_book_for_runtime_mode(&self, mut book: Book) -> Result<Book> {
+        let mermaid_re = Regex::new(r#"```mermaid\r?\n([\s\S]*?)\r?\n```"#)?;
+
+        for item in &mut book.sections {
+            Self::process_book_item_for_runtime_mode(&mermaid_re, item);
+        }
+
+        Ok(book)
+    }
+
+    /// Recursively process book items to convert mermaid blocks to HTML `pre` tags
+    fn process_book_item_for_runtime_mode(mermaid_re: &Regex, book_item: &mut BookItem) {
+        if let BookItem::Chapter(chapter) = book_item {
+            chapter.content = mermaid_re.replace_all(&chapter.content, |caps: &regex::Captures| {
+                let diagram_code = &caps[1];
+                format!("<pre class=\"mermaid\">\n{}\n</pre>", diagram_code)
+            }).to_string();
+
+            for sub_item in &mut chapter.sub_items {
+                Self::process_book_item_for_runtime_mode(mermaid_re, sub_item);
+            }
+        }
     }
 
     async fn async_process_book(&self, ctx: &PreprocessorContext, book: &mut Book) -> Result<()> {
@@ -56,7 +172,15 @@ impl DiagramsPreprocessor {
             ));
         }
 
-        let edits: Vec<ChapterEdit> = futures::future::join_all(all_futures).await.into_iter().filter_map(|e| e.ok()).collect();
+        let edits: Vec<ChapterEdit> = futures::future::join_all(all_futures).await.into_iter()
+            .filter_map(|e| match e {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("[mdbook-diagrams] Failed to generate diagram: {}", e);
+                    None
+                }
+            }
+        ).collect();
 
         // Group edits by chapter path for easier processing
         let mut edits_by_chapter: HashMap<PathBuf, Vec<ChapterEdit>> = HashMap::new();
@@ -118,7 +242,7 @@ impl DiagramsPreprocessor {
         futures
     }
 
-    /// Generate SVGs for all mermaid blocks in a chapter and return a list of edits to apply.
+    /// Generate diagrams for all mermaid blocks in a chapter and return a list of edits to apply.
     fn collect_edits_from_chapter(
         &'_ self,
         mermaid_re: & Regex,
@@ -128,24 +252,17 @@ impl DiagramsPreprocessor {
     ) -> Vec<BoxFuture<'_, Result<ChapterEdit>>> {
         let mut futures = Vec::new();
 
-        let mmdc_cmd = self.config
-            .as_ref()
-            .and_then(|table| table.get("mmdc_cmd"))
-            .and_then(|val| val.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "mmdc".to_string());
-
         for cap in mermaid_re.captures_iter(&chapter.content) {
             let full_match_range = cap.get(0).unwrap().range();
             let mermaid_code = cap[1].to_string();
 
             let uuid = Uuid::new_v4();
-            let svg_filename = format!("{}.svg", uuid);
-            let svg_filepath = output_dir.join(&svg_filename);
+            let output_filename = format!("{}.{}", uuid, self.output_format);
+            let output_filepath = output_dir.join(&output_filename);
 
             let chapter_path = chapter.path.clone().unwrap_or_default();
 
-            let relative_svg_path = {
+            let relative_output_path = {
                 let chapter_dir_relative_to_src = chapter
                     .path
                     .as_ref()
@@ -159,12 +276,12 @@ impl DiagramsPreprocessor {
                 }
                 path.push("generated");
                 path.push("diagrams");
-                path.push(&svg_filename);
+                path.push(&output_filename);
                 path
             };
 
             let semaphore_clone = semaphore.clone();
-            let mmdc_cmd_clone = mmdc_cmd.clone();
+            let mmdc_cmd = self.mmdc_cmd.clone();
 
             futures.push(async move {
                 let _permit = semaphore_clone.acquire().await?;
@@ -172,21 +289,21 @@ impl DiagramsPreprocessor {
                     let mut cmd = tokio::process::Command::new("powershell");
                     cmd.arg("-NoProfile")
                         .arg("-Command")
-                        .arg(&mmdc_cmd_clone)
+                        .arg(&mmdc_cmd)
                         .arg("-i")
                         .arg("-")
                         .arg("-o")
-                        .arg(&svg_filepath)
+                        .arg(&output_filepath)
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
                     cmd
                 } else {
-                    let mut cmd = tokio::process::Command::new(&mmdc_cmd_clone);
+                    let mut cmd = tokio::process::Command::new(&mmdc_cmd);
                     cmd.arg("-i")
                         .arg("-")
                         .arg("-o")
-                        .arg(&svg_filepath)
+                        .arg(&output_filepath)
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped());
@@ -212,7 +329,7 @@ impl DiagramsPreprocessor {
 
                 let img_tag = format!(
                     "![diagram](./{})",
-                    relative_svg_path.to_string_lossy().replace("\\", "/")
+                    relative_output_path.to_string_lossy().replace("\\", "/")
                 );
                 Ok(ChapterEdit {
                     chapter_path,
@@ -231,11 +348,19 @@ impl Preprocessor for DiagramsPreprocessor {
     }
 
     fn run(&self, ctx: &PreprocessorContext, mut book: Book) -> Result<Book> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
+        match self.render_mode {
+            RenderMode::Runtime => {
+                self.prepare_mermaid_files(ctx)?;
+                book = self.process_book_for_runtime_mode(book)?;
+            }
+            RenderMode::PreRender => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
 
-        runtime.block_on(self.async_process_book(ctx, &mut book))?;
+                runtime.block_on(self.async_process_book(ctx, &mut book))?;
+            }
+        }
 
         Ok(book)
     }
